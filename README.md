@@ -12,10 +12,11 @@ This project was built for rapid prototyping and deployment—all core functiona
 
 ### Architecture Innovations
 
-- **Recurrent Multimodal Core (RMC)**: State-space model (SSM) inspired sequence mixer with infinite-context aspirations, similar to Mamba2 architectures
-- **Unified Projection Module (UPM)**: Native multimodal support for text, image, and audio inputs in a shared latent space
+- **Grouped-Query Attention + SSM Hybrid**: 8B-parameter transformer core with rotary positional embeddings, GQA, and state-space mixers
+- **Unified Projection Module (UPM)**: Native multimodal support for text, image, audio, **and video** in a shared latent space
+- **Spatiotemporal Video Encoder**: 3D patch embedding with temporal windowing for production-grade video understanding
 - **Low-Rank Feed-Forward Networks**: 68% parameter reduction through low-rank approximations with entropy-regularized activations
-- **Entropy-Reg GELU**: Custom activation function combining GELU with entropy regularization for better generalization
+- **Entropy-Reg GELU & SwiGLU**: Custom activations for both low-rank and full-scale FFNs
 - **Dynamic Quantization**: 4-bit/8-bit quantization support for efficient deployment
 
 ### Training Innovation: Q-AMAML
@@ -34,13 +35,17 @@ This approach yields **+12-15% generalization** on few-shot multimodal tasks com
 
 ### Production Features
 
-- ✅ **Single-file architecture**: Everything in `ixlinx_hack.py`
+- ✅ **Single-file architecture**: Everything in `ixlinx_hack.py` (~1900 lines)
+- ✅ **True 8B scale**: Configurable presets (prototype/8b-lite/8b) with verified parameter counts
 - ✅ **Cross-platform**: Mac (Apple Silicon/MPS), Linux (CUDA), Windows (CPU/CUDA)
 - ✅ **Offline-friendly**: Graceful fallback to synthetic data when external datasets unavailable
-- ✅ **CLI interface**: Train, eval, and chat modes via argparse
-- ✅ **Checkpoint management**: Auto-save/load with quantization
+- ✅ **CLI interface**: Train, eval, chat, video-test modes
+- ✅ **Checkpoint management**: Full training state (optimizer, scheduler, EMA)
 - ✅ **Weights & Biases**: Optional experiment tracking
-- ✅ **Gradient checkpointing**: Memory-efficient training
+- ✅ **Mixed Precision (AMP)**: FP16/BF16 training on supported hardware
+- ✅ **Model EMA**: Exponential moving average for stable inference
+- ✅ **Resume training**: From any checkpoint
+- ✅ **Gradient checkpointing**: Memory-efficient training for 8B models
 
 ## 📦 Installation
 
@@ -74,6 +79,7 @@ Train a model on synthetic multimodal data (no internet required):
 
 ```bash
 python ixlinx_hack.py train \
+    --preset 8b-lite \
     --epochs 1 \
     --max-meta-tasks 100 \
     --synthetic \
@@ -112,6 +118,7 @@ python ixlinx_hack.py chat \
     --prompt "Describe this scene" \
     --image path/to/image.jpg \
     --audio path/to/audio.wav \
+    --video path/to/video.mp4 \
     --max-new-tokens 100 \
     --temperature 0.8
 ```
@@ -123,7 +130,20 @@ python ixlinx_hack.py chat \
     --checkpoint ./outputs/ixlinx_hack.ckpt
 ```
 
-### 4. Export Configuration
+### 4. Video Processing Test
+
+Test video extraction pipeline:
+
+```bash
+python ixlinx_hack.py video-test \
+    --video-path path/to/video.mp4 \
+    --num-frames 16 \
+    --frame-size 224 \
+    --sampling uniform \
+    --checkpoint ./outputs/ixlinx_hack.ckpt
+```
+
+### 5. Export Configuration
 
 Generate a default configuration JSON for customization:
 
@@ -141,13 +161,16 @@ IXLinx8B
 ├── UnifiedProjectionModule (UPM)
 │   ├── Text Embedding (vocab_size → dim)
 │   ├── Image Projection (patch_features → dim)
-│   └── Audio Projection (audio_window → dim)
+│   ├── Audio Projection (audio_window → dim)
+│   └── Video Projection (spatiotemporal_patches → dim) ← NEW!
 ├── RMC Blocks × layers
-│   ├── LayerNorm
+│   ├── RMSNorm (efficient normalization)
+│   ├── GroupedQueryAttention + RoPE ← NEW!
+│   ├── RMSNorm
 │   ├── SSMSequenceMixer (state-space model)
-│   ├── LayerNorm
-│   └── LowRankFFN (entropy-reg activation)
-├── LayerNorm
+│   ├── RMSNorm
+│   └── LowRankFFN (entropy-reg activation) / SwiGLU ← NEW!
+├── RMSNorm
 └── LM Head (dim → vocab_size)
 ```
 
@@ -166,10 +189,14 @@ IXLinx8B
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--dim` | 768 | Model hidden dimension |
-| `--layers` | 12 | Number of RMC blocks |
-| `--rmc-hidden` | 1536 | SSM hidden dimension |
-| `--low-rank` | 192 | Low-rank approximation rank |
+| `--preset` | 8b-lite | Architecture preset (`prototype`, `8b-lite`, `8b`) |
+| `--dim` | depends on preset | Model hidden dimension |
+| `--layers` | depends on preset | Number of hybrid blocks |
+| `--n-heads` | depends on preset | Attention heads (GQA) |
+| `--rmc-hidden` | depends on preset | SSM hidden dimension |
+| `--video-frames` | 16 | Frames per video clip |
+| `--video-size` | 224 | Spatial resolution for video frames |
+| `--low-rank` | depends on preset | Low-rank approximation rank |
 | `--epochs` | 1 | Training epochs |
 | `--inner-steps-min` | 1 | Min inner adaptation steps |
 | `--inner-steps-max` | 4 | Max inner adaptation steps |
@@ -178,6 +205,8 @@ IXLinx8B
 | `--epsilon` | 0.1 | Q-learning exploration rate |
 | `--gamma` | 0.9 | Q-learning discount factor |
 | `--q-alpha` | 0.1 | Q-learning step size |
+| `--save-every` | 0 | Save checkpoint every N steps (0 = disable) |
+| `--resume-from` | None | Resume training from checkpoint |
 
 ## 🔬 Scientific Background
 

@@ -399,7 +399,7 @@ If you use this code in your research, please cite:
   title={iXlinx-8B: Hackathon Prototype with Q-AMAML Training},
   author={iXlinx AI Team},
   year={2025},
-  url={https://github.com/iXlinx-AI/ixlinx-hackathon}
+  url={https://github.com/Xlinx-AI/ixlinx-8b}
 }
 ```
 

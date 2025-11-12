@@ -108,7 +108,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - hard dependency
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
-from torch.nn.utils.stateless import functional_call
+from torch.func import functional_call
 
 try:  # Optional dependency: Hugging Face datasets
     from datasets import load_dataset
@@ -1219,7 +1219,10 @@ def compute_loss(
     buffers: Optional[OrderedDict[str, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     if params is not None:
-        logits = functional_call(model, params, (batch,), buffers=buffers)
+        params_and_buffers = OrderedDict(params)
+        if buffers is not None:
+            params_and_buffers.update(buffers)
+        logits = functional_call(model, params_and_buffers, (batch,))
     else:
         logits = model(batch)
     targets = batch["targets"].to(logits.device)

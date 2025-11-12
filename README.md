@@ -234,15 +234,6 @@ This enables:
 - Adaptive augmentation per modality
 - Context-aware inner-loop scheduling
 
-### Expected Performance
-
-| Benchmark | Target | Notes |
-|-----------|--------|-------|
-| MMLU | >72% | Multi-task language understanding |
-| VQA | >78% | Visual question answering |
-| LongBench | >85% | Long-context recall (1M tokens) |
-| Inference | 40-50 t/s | Apple M2, 16GB RAM |
-
 ## 🛠️ Advanced Usage
 
 ### Custom Model Configuration

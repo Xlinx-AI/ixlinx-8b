@@ -1,86 +1,5 @@
-"""Production-ready single-file implementation of iXlinx-8B with full video recognition.
 
-iXlinx-8B is a recurrent multimodal large language model with 8 billion parameters,
-featuring Q-AMAML (Q-Learning Augmented Meta-Adaptation for Multimodal Learning).
 
-ARCHITECTURE FEATURES:
-======================
-* True 8B parameters with configurable presets (prototype/8b-lite/8b)
-* Grouped-Query Attention (GQA) with RoPE positional embeddings
-* RMSNorm for efficient normalization
-* SwiGLU activation functions for FFN layers
-* Hybrid architecture: GQA + SSM (State-Space Model) + Low-rank FFN
-* Gradient checkpointing for memory efficiency
-* Mixed precision training (AMP) support
-* Flash Attention compatible (optional)
-
-MULTIMODAL CAPABILITIES:
-========================
-* Text: Token embeddings with learnable positional encodings
-* Images: Patch-based projection (16x16 patches)
-* Audio: Windowed projection with overlap
-* Video: Full 3D spatiotemporal patch embedding (NEW!)
-  - Temporal and spatial patch decomposition
-  - Frame sampling strategies (uniform/random/adaptive)
-  - Support for CV2 and torchvision backends
-  - Handles variable-length videos
-
-VIDEO PROCESSING:
-=================
-* extract_video_frames(): Robust video frame extraction
-* VideoPatchEmbed: 3D conv-free spatiotemporal patching
-* Temporal attention over video frames
-* Video-aware data augmentation (frame dropout, noise)
-* CLI video-test command for pipeline validation
-
-PRODUCTION FEATURES:
-====================
-* Exponential Moving Average (EMA) of model weights
-* Cosine learning rate schedule with warmup
-* Advanced checkpointing (optimizer, scheduler, EMA state)
-* Resume training from checkpoint
-* Comprehensive logging with learning rate tracking
-* Modality-weighted fusion
-* Video-heavy augmentation strategies
-
-Q-AMAML META-LEARNING:
-======================
-* First-order MAML with inner-loop adaptation
-* Q-learning agent for dynamic augmentation policy
-* Support for 6 task mixes (text/vision/audio/video-heavy, balanced, long-context)
-* Reward function balancing perplexity, stability, and efficiency
-
-COMMAND-LINE INTERFACE:
-=======================
-* train: Meta-training with presets (prototype/8b-lite/8b)
-* eval: Model evaluation on validation set
-* chat: Interactive inference with multimodal inputs (text/image/audio/video)
-* video-test: Validate video processing pipeline
-* export-config: Export configuration templates
-
-USAGE EXAMPLES:
-===============
-# Train 8B model (full scale):
-python ixlinx_hack.py train --preset 8b --synthetic --epochs 1 --device cuda
-
-# Train 8B-lite (faster prototyping):
-python ixlinx_hack.py train --preset 8b-lite --synthetic --epochs 1
-
-# Chat with video input:
-python ixlinx_hack.py chat --checkpoint outputs/ixlinx_hack.ckpt --video path/to/video.mp4 --prompt "Describe this video"
-
-# Test video pipeline:
-python ixlinx_hack.py video-test --video-path path/to/video.mp4 --num-frames 16
-
-DEPENDENCIES:
-=============
-Core: torch>=2.0.0
-Optional: transformers, datasets, PIL, librosa, cv2, torchvision
-Video: cv2 (opencv-python) OR torchvision
-
-The entire model fits in a single file for easy deployment and experimentation.
-All components are production-grade with proper error handling, logging, and documentation.
-"""
 
 from __future__ import annotations
 
@@ -100,7 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     import torch
-except ModuleNotFoundError as exc:  # pragma: no cover - hard dependency
+except ModuleNotFoundError as exc:  
     raise RuntimeError(
         "PyTorch is required to run ixlinx_hack.py. Install it via `pip install torch`."
     ) from exc
@@ -110,43 +29,43 @@ import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.func import functional_call
 
-try:  # Optional dependency: Hugging Face datasets
+try:  
     from datasets import load_dataset
-except Exception:  # pragma: no cover - optional dependency guard
-    load_dataset = None  # type: ignore
+except Exception:  
+    load_dataset = None  
 
-try:  # Optional dependency: Hugging Face tokenizers
+try:  
     from transformers import AutoTokenizer
-except Exception:  # pragma: no cover - optional dependency guard
-    AutoTokenizer = None  # type: ignore
+except Exception:  
+    AutoTokenizer = None  
 
-try:  # Optional dependency for images
+try:  
     from PIL import Image
-except Exception:  # pragma: no cover - optional dependency guard
-    Image = None  # type: ignore
+except Exception:  
+    Image = None  
 
-try:  # Optional dependency for audio
-    import librosa  # type: ignore
-except Exception:  # pragma: no cover - optional dependency guard
-    librosa = None  # type: ignore
+try:  
+    import librosa  
+except Exception:  
+    librosa = None  
 
-try:  # Optional dependency for video decoding (torchvision)
-    from torchvision.io import read_video  # type: ignore
-except Exception:  # pragma: no cover - optional dependency guard
-    read_video = None  # type: ignore
+try:  
+    from torchvision.io import read_video  
+except Exception:  
+    read_video = None  
 
-try:  # Optional dependency for video decoding (OpenCV)
-    import cv2  # type: ignore
-except Exception:  # pragma: no cover - optional dependency guard
-    cv2 = None  # type: ignore
+try:  
+    import cv2  
+except Exception:  
+    cv2 = None  
 
 
-# ---------------------------------------------------------------------------
-# Logging & Utilities
-# ---------------------------------------------------------------------------
+
+
+
 
 def configure_logging(verbosity: str = "info") -> None:
-    """Initialise pretty logging for CLI usage."""
+    
 
     level = getattr(logging, verbosity.upper(), logging.INFO)
     logging.basicConfig(
@@ -159,7 +78,7 @@ def configure_logging(verbosity: str = "info") -> None:
 
 
 def detect_device(preferred: Optional[str] = None) -> torch.device:
-    """Detect the best available torch device with optional preference order."""
+    
 
     if preferred == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
@@ -199,17 +118,7 @@ def extract_video_frames(
     size: Tuple[int, int] = (224, 224),
     sampling: str = "uniform",
 ) -> torch.Tensor:
-    """Extract frames from video file with various sampling strategies.
     
-    Args:
-        video_path: Path to video file
-        num_frames: Number of frames to extract
-        size: Target frame size (height, width)
-        sampling: Sampling strategy - "uniform", "random", "adaptive"
-        
-    Returns:
-        Tensor of shape (num_frames, 3, height, width)
-    """
     if cv2 is not None:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -290,14 +199,14 @@ def extract_video_frames(
         return torch.zeros(num_frames, 3, size[0], size[1])
 
 
-# ---------------------------------------------------------------------------
-# Configuration dataclasses
-# ---------------------------------------------------------------------------
+
+
+
 
 
 @dataclass
 class ModelConfig:
-    """Configuration for the iXlinx8B production model (true 8B parameters)."""
+    
 
     vocab_size: int = 32_000
     dim: int = 4096
@@ -325,7 +234,7 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    """Configuration for Q-AMAML meta-training."""
+    
 
     epochs: int = 1
     meta_batch_size: int = 2
@@ -367,13 +276,13 @@ class QuantConfig:
     dtype: str = "int8"
 
 
-# ---------------------------------------------------------------------------
-# Dataset helpers and offline-friendly synthetic data
-# ---------------------------------------------------------------------------
+
+
+
 
 
 class SyntheticMultimodalDataset:
-    """Generate synthetic multimodal samples for quick prototyping."""
+    
 
     def __init__(
         self,
@@ -414,10 +323,10 @@ class SyntheticMultimodalDataset:
             generator=generator,
         )
         modalities = torch.tensor([
-            random.random(),  # text strength
-            random.random(),  # vision strength
-            random.random(),  # audio strength
-            random.random(),  # video strength
+            random.random(),  
+            random.random(),  
+            random.random(),  
+            random.random(),  
         ])
         return {
             "text": text[:-1],
@@ -435,7 +344,7 @@ def load_multimodal_dataset(
     model_config: ModelConfig,
     split: str = "train",
 ) -> SyntheticMultimodalDataset:
-    """Attempt to load a real multimodal dataset, falling back to synthetic."""
+    
 
     if config.synthetic or load_dataset is None:
         logging.info("Using synthetic multimodal dataset (%s split).", split)
@@ -451,7 +360,7 @@ def load_multimodal_dataset(
         text_ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
         vision_ds = load_dataset("laion/laion-aesthetics_v2", split=f"{split}[:1%]")
         audio_ds = load_dataset("ashraq/esc50", split=split)
-    except Exception as exc:  # pragma: no cover - network dependent
+    except Exception as exc:  
         logging.warning("Falling back to synthetic dataset: %s", exc)
         return SyntheticMultimodalDataset(
             length=1024 if split == "train" else 256,
@@ -459,11 +368,11 @@ def load_multimodal_dataset(
             seq_len=min(128, model_config.max_seq_len - 1),
         )
 
-    # In a hackathon context we pair the three datasets by cycling the shorter
-    # ones. This keeps the code succinct while covering all modalities.
+    
+    
     min_len = min(len(text_ds), len(vision_ds), len(audio_ds))
 
-    class HuggingFaceMultimodalDataset(SyntheticMultimodalDataset):  # type: ignore
+    class HuggingFaceMultimodalDataset(SyntheticMultimodalDataset):  
         def __init__(self) -> None:
             super().__init__(
                 length=min_len,
@@ -492,7 +401,7 @@ def load_multimodal_dataset(
                 )
                 token_ids = torch.cat([token_ids, pad], dim=0)
 
-            # Vision: convert to tensor if PIL is available, otherwise random.
+            
             if Image is not None and isinstance(vision_item.get("image"), Image.Image):
                 try:
                     image = pil_image_to_tensor(vision_item["image"])
@@ -501,7 +410,7 @@ def load_multimodal_dataset(
             else:
                 image = torch.randn(3, 64, 64)
 
-            # Audio: decode waveform or random noise.
+            
             if librosa is not None and "file" in audio_item:
                 file_path = audio_item["file"]
                 if os.path.exists(file_path):
@@ -518,7 +427,7 @@ def load_multimodal_dataset(
                 audio = F.pad(audio, (0, self.audio_len - audio.numel()))
             audio = audio[: self.audio_len]
 
-            # Video: attempt to locate path, otherwise synthetic.
+            
             video = torch.randn(self.video_frames, 3, self.video_size, self.video_size)
             candidate_path = vision_item.get("path") if isinstance(vision_item, dict) else None
             if isinstance(candidate_path, str) and os.path.exists(candidate_path):
@@ -555,9 +464,9 @@ def load_multimodal_dataset(
     return HuggingFaceMultimodalDataset()
 
 
-# ---------------------------------------------------------------------------
-# Meta-task sampling and collate utilities
-# ---------------------------------------------------------------------------
+
+
+
 
 
 @dataclass
@@ -587,7 +496,7 @@ def collate_batch(samples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 
 
 class MetaTaskSampler:
-    """Sample meta-learning tasks from a base dataset."""
+    
 
     def __init__(
         self,
@@ -637,13 +546,13 @@ class MetaTaskSampler:
         return self.config.max_meta_tasks
 
 
-# ---------------------------------------------------------------------------
-# Q-learning agent for meta-augmentation policy
-# ---------------------------------------------------------------------------
+
+
+
 
 
 class QAgent:
-    """Tabular Q-learning agent controlling task augmentations and inner steps."""
+    
 
     def __init__(
         self,
@@ -697,7 +606,7 @@ class QAgent:
         action: int,
         inner_steps_bounds: Tuple[int, int],
     ) -> Dict[str, Any]:
-        """Map discrete actions to augmentation strength and inner-loop steps."""
+        
 
         steps_min, steps_max = inner_steps_bounds
         step_choices = list(range(steps_min, steps_max + 1))
@@ -720,9 +629,9 @@ class QAgent:
         }
 
 
-# ---------------------------------------------------------------------------
-# Model components: Production 8B architecture
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def precompute_rope_freqs(
@@ -731,7 +640,7 @@ def precompute_rope_freqs(
     theta: float = 10000.0,
     device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Precompute rotary position embedding frequencies."""
+    
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
     t = torch.arange(max_seq_len, device=device, dtype=inv_freq.dtype)
     freqs = torch.outer(t, inv_freq)
@@ -745,7 +654,7 @@ def apply_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply rotary position embeddings to query/key tensors."""
+    
     seq_len = x.shape[1]
     cos = cos[:seq_len].unsqueeze(0).unsqueeze(2)
     sin = sin[:seq_len].unsqueeze(0).unsqueeze(2)
@@ -762,7 +671,7 @@ def apply_rope(
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (more efficient than LayerNorm)."""
+    
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -775,7 +684,7 @@ class RMSNorm(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    """SwiGLU activation for feed-forward networks."""
+    
 
     def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
@@ -789,7 +698,7 @@ class SwiGLU(nn.Module):
 
 
 class EntropyRegGELU(nn.Module):
-    """Entropy-regularised GELU activation inspired by entropy annealing."""
+    
 
     def __init__(self, beta: float = 0.05) -> None:
         super().__init__()
@@ -803,7 +712,7 @@ class EntropyRegGELU(nn.Module):
 
 
 class LowRankLinear(nn.Module):
-    """Low-rank approximation of a linear layer with optional residual."""
+    
 
     def __init__(self, in_features: int, out_features: int, rank: int) -> None:
         super().__init__()
@@ -829,7 +738,7 @@ class LowRankFFN(nn.Module):
 
 
 class VideoPatchEmbed(nn.Module):
-    """Project spatiotemporal patches into the model dimension."""
+    
 
     def __init__(self, dim: int, patch_size: int, temporal_patch: int) -> None:
         super().__init__()
@@ -838,7 +747,7 @@ class VideoPatchEmbed(nn.Module):
         self.proj = nn.Linear(3 * patch_size * patch_size * temporal_patch, dim)
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
-        # video: (batch, frames, 3, H, W)
+        
         batch, frames, channels, height, width = video.shape
         pad_t = (self.temporal_patch - frames % self.temporal_patch) % self.temporal_patch
         if pad_t:
@@ -857,13 +766,13 @@ class VideoPatchEmbed(nn.Module):
         video = video.view(b * windows, ch * tp, h, w)
         patches = F.unfold(video, kernel_size=self.patch_size, stride=self.patch_size)
         patches = patches.transpose(1, 2)
-        patches = patches.view(b, windows, patches.size(1), patches.size(2))
-        patches = patches.view(b, -1, patches.size(-1))
+        patches = patches.reshape(b, windows, patches.size(1), patches.size(2))
+        patches = patches.reshape(b, -1, patches.size(-1))
         return self.proj(patches)
 
 
 class GroupedQueryAttention(nn.Module):
-    """Grouped-query attention (GQA) for efficient multi-head attention."""
+    
 
     def __init__(
         self,
@@ -944,7 +853,7 @@ class GroupedQueryAttention(nn.Module):
 
 
 class SSMSequenceMixer(nn.Module):
-    """Simplified state-space mixer inspired by Mamba-like architectures."""
+    
 
     def __init__(self, dim: int, hidden: int) -> None:
         super().__init__()
@@ -1201,15 +1110,15 @@ class IXLinx8B(nn.Module):
                 dtype=dtype,
             )
             logging.info("Applied dynamic quantisation (%s)", dtype)
-            return quantized  # type: ignore[return-value]
+            return quantized  
         except Exception as exc:
             logging.warning("Dynamic quantisation failed: %s", exc)
             return self
 
 
-# ---------------------------------------------------------------------------
-# Loss, metrics, reward helpers
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def compute_loss(
@@ -1251,9 +1160,9 @@ def compute_reward(
     return reward
 
 
-# ---------------------------------------------------------------------------
-# Q-AMAML Training Loop
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def apply_task_augmentation(
@@ -1261,7 +1170,7 @@ def apply_task_augmentation(
     strength: float,
     mix: str,
 ) -> MetaTask:
-    """Apply lightweight task augmentation guided by Q-agent decisions."""
+    
 
     def augment(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         augmented = {k: v.clone() for k, v in batch.items()}
@@ -1298,7 +1207,7 @@ def apply_task_augmentation(
 
 
 class ModelEMA:
-    """Exponential Moving Average for model parameters."""
+    
     
     def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
         self.model = model
@@ -1399,7 +1308,7 @@ def q_amaml_train(
                 meta_task,
                 strength=q_agent.action_to_specs(0, (config.inner_steps_min, config.inner_steps_max))["augmentation_strength"],
                 mix="balanced",
-            )  # warm start with mild augmentation
+            )  
 
             state = q_agent.encode_state(task.metadata)
             action = q_agent.select_action(state)
@@ -1410,7 +1319,7 @@ def q_amaml_train(
             params = OrderedDict(model.named_parameters())
             grads_for_reward: List[torch.Tensor] = []
 
-            # Inner loop adaptation (first-order MAML approximation)
+            
             for _ in range(inner_steps):
                 optimizer.zero_grad()
                 support_batch = {k: v.to(device) for k, v in task.support.items()}
@@ -1424,6 +1333,7 @@ def q_amaml_train(
                     params.values(),
                     retain_graph=False,
                     create_graph=False,
+                    allow_unused=True,
                 )
                 params = OrderedDict(
                     (name, param - config.inner_lr * grad if grad is not None else param)
@@ -1497,9 +1407,9 @@ def q_amaml_train(
     return optimizer, scheduler, ema, global_step, config.epochs
 
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def evaluate(model: IXLinx8B, sampler: MetaTaskSampler, device: torch.device) -> Dict[str, float]:
@@ -1527,9 +1437,9 @@ def evaluate(model: IXLinx8B, sampler: MetaTaskSampler, device: torch.device) ->
     return metrics_accum
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint utilities
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def save_checkpoint(
@@ -1586,14 +1496,14 @@ def load_checkpoint(
 
 
 def load_checkpoint_simple(path: Path, device: torch.device) -> IXLinx8B:
-    """Simple checkpoint loading without optimizer/scheduler state."""
+    
     model, _ = load_checkpoint(path, device)
     return model
 
 
-# ---------------------------------------------------------------------------
-# CLI helpers
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def ensure_tokenizer(model_config: ModelConfig) -> Any:
@@ -1602,7 +1512,7 @@ def ensure_tokenizer(model_config: ModelConfig) -> Any:
             tokenizer = AutoTokenizer.from_pretrained("gpt2")
             tokenizer.pad_token = tokenizer.eos_token
             return tokenizer
-        except Exception as exc:  # pragma: no cover - network dependent
+        except Exception as exc:  
             logging.warning("Falling back to naive tokenizer: %s", exc)
     logging.warning("Using whitespace tokenizer fallback")
 
@@ -1861,7 +1771,7 @@ def cli_chat(args: argparse.Namespace) -> None:
 
 
 def cli_video_test(args: argparse.Namespace) -> None:
-    """Test video extraction and processing pipeline."""
+    
     configure_logging(args.verbosity)
     device = detect_device(args.device)
     
@@ -1906,9 +1816,9 @@ def cli_export_config(args: argparse.Namespace) -> None:
     logging.info("Exported default configuration to %s", path)
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing and main
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2019,7 +1929,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         cli_video_test(args)
     elif args.mode == "export-config":
         cli_export_config(args)
-    else:  # pragma: no cover - defensive programming
+    else:  
         raise ValueError(f"Unsupported mode: {args.mode}")
 
 

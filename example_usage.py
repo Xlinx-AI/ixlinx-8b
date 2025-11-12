@@ -1,19 +1,10 @@
-#!/usr/bin/env python3
-"""Example usage script demonstrating the iXlinx-8B prototype.
-
-This script shows how to:
-1. Train a small model with Q-AMAML on synthetic data
-2. Save and load checkpoints
-3. Run inference with the trained model
-"""
-
 import subprocess
 import sys
 from pathlib import Path
 
 
 def run_training_example():
-    """Train a small model with minimal resources."""
+    
     print("=" * 60)
     print("Training Example: Small model on synthetic data")
     print("=" * 60)
@@ -41,7 +32,7 @@ def run_training_example():
 
 
 def run_evaluation_example():
-    """Evaluate the trained model."""
+    
     print("\n" + "=" * 60)
     print("Evaluation Example: Testing the checkpoint")
     print("=" * 60)
@@ -66,7 +57,7 @@ def run_evaluation_example():
 
 
 def run_chat_example():
-    """Run a simple chat example."""
+    
     print("\n" + "=" * 60)
     print("Chat Example: Interactive generation")
     print("=" * 60)
@@ -92,7 +83,7 @@ def run_chat_example():
 
 
 def run_config_export_example():
-    """Export default configuration."""
+    
     print("\n" + "=" * 60)
     print("Config Export Example")
     print("=" * 60)
@@ -121,7 +112,7 @@ def run_config_export_example():
 
 
 def main():
-    """Run all examples in sequence."""
+    
     print("iXlinx-8B Prototype - Example Usage")
     print("=" * 60)
     print("This script demonstrates the key features of the ixlinx_hack.py")

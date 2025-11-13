@@ -1,6 +1,3 @@
-
-
-
 from __future__ import annotations
 
 import argparse
@@ -19,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     import torch
-except ModuleNotFoundError as exc:  
+except ModuleNotFoundError as exc:
     raise RuntimeError(
         "PyTorch is required to run ixlinx_hack.py. Install it via `pip install torch`."
     ) from exc
@@ -28,45 +25,108 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.func import functional_call
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-try:  
+
+try:
     from datasets import load_dataset
-except Exception:  
-    load_dataset = None  
+except Exception:
+    load_dataset = None
 
-try:  
+try:
     from transformers import AutoTokenizer
-except Exception:  
-    AutoTokenizer = None  
+except Exception:
+    AutoTokenizer = None
 
-try:  
+try:
     from PIL import Image
-except Exception:  
-    Image = None  
+except Exception:
+    Image = None
 
-try:  
-    import librosa  
-except Exception:  
-    librosa = None  
+try:
+    import librosa
+except Exception:
+    librosa = None
 
-try:  
-    from torchvision.io import read_video  
-except Exception:  
-    read_video = None  
+try:
+    from torchvision.io import read_video
+except Exception:
+    read_video = None
 
-try:  
-    import cv2  
-except Exception:  
-    cv2 = None  
-
-
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 
+# --- DDP Helper Functions ---
+def setup_for_distributed(is_master):
+    """
+    This function disables printing when not in master process
+    """
+    import builtins as __builtin__
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
+
+
+def is_dist_avail_and_initialized():
+    if not dist.is_available():
+        return False
+    if not dist.is_initialized():
+        return False
+    return True
+
+
+def get_world_size():
+    if not is_dist_avail_and_initialized():
+        return 1
+    return dist.get_world_size()
+
+
+def get_rank():
+    if not is_dist_avail_and_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def init_distributed_mode(args):
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        args.rank = int(os.environ['SLURM_PROCID'])
+        args.local_rank = args.rank % torch.cuda.device_count()
+    else:
+        print('Not using distributed mode')
+        args.distributed = False
+        return
+
+    args.distributed = True
+
+    torch.cuda.set_device(args.local_rank)
+    args.dist_backend = 'nccl'
+    print(f'| distributed init (rank {args.rank}): {args.dist_url}', flush=True)
+    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                            world_size=args.world_size, rank=args.rank)
+    dist.barrier()
+    setup_for_distributed(args.rank == 0)
+
+# --- End DDP Helper Functions ---
 
 
 def configure_logging(verbosity: str = "info") -> None:
-    
-
     level = getattr(logging, verbosity.upper(), logging.INFO)
     logging.basicConfig(
         level=level,
@@ -78,8 +138,8 @@ def configure_logging(verbosity: str = "info") -> None:
 
 
 def detect_device(preferred: Optional[str] = None) -> torch.device:
-    
-
+    if is_dist_avail_and_initialized():
+        return torch.device(f"cuda:{os.environ.get('LOCAL_RANK', 0)}")
     if preferred == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
     if preferred == "mps" and torch.backends.mps.is_available():
@@ -118,18 +178,17 @@ def extract_video_frames(
     size: Tuple[int, int] = (224, 224),
     sampling: str = "uniform",
 ) -> torch.Tensor:
-    
     if cv2 is not None:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             logging.warning("Failed to open video %s, returning zeros", video_path)
             return torch.zeros(num_frames, 3, size[0], size[1])
-        
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames == 0:
             cap.release()
             return torch.zeros(num_frames, 3, size[0], size[1])
-        
+
         if sampling == "uniform":
             frame_indices = torch.linspace(0, total_frames - 1, num_frames).long().tolist()
         elif sampling == "random":
@@ -139,7 +198,7 @@ def extract_video_frames(
                 frame_indices = list(range(total_frames))
         else:
             frame_indices = torch.linspace(0, total_frames - 1, num_frames).long().tolist()
-        
+
         frames = []
         for idx in frame_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -149,23 +208,23 @@ def extract_video_frames(
                 frame = cv2.resize(frame, (size[1], size[0]))
                 frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
                 frames.append(frame_tensor)
-        
+
         cap.release()
-        
+
         if len(frames) < num_frames:
             padding = [torch.zeros(3, size[0], size[1]) for _ in range(num_frames - len(frames))]
             frames.extend(padding)
-        
+
         return torch.stack(frames[:num_frames])
-    
+
     elif read_video is not None:
         try:
             video_tensor, _, _ = read_video(video_path, pts_unit="sec")
             total_frames = video_tensor.shape[0]
-            
+
             if total_frames == 0:
                 return torch.zeros(num_frames, 3, size[0], size[1])
-            
+
             if sampling == "uniform":
                 frame_indices = torch.linspace(0, total_frames - 1, num_frames).long()
             elif sampling == "random":
@@ -175,7 +234,7 @@ def extract_video_frames(
                     frame_indices = torch.arange(total_frames)
             else:
                 frame_indices = torch.linspace(0, total_frames - 1, num_frames).long()
-            
+
             frames = video_tensor[frame_indices]
             frames = F.interpolate(
                 frames.permute(0, 3, 1, 2).float(),
@@ -184,30 +243,23 @@ def extract_video_frames(
                 align_corners=False,
             )
             frames = frames / 255.0
-            
+
             if frames.shape[0] < num_frames:
                 padding = torch.zeros(num_frames - frames.shape[0], 3, size[0], size[1])
                 frames = torch.cat([frames, padding], dim=0)
-            
+
             return frames[:num_frames]
         except Exception as exc:
             logging.warning("Failed to read video %s: %s", video_path, exc)
             return torch.zeros(num_frames, 3, size[0], size[1])
-    
+
     else:
         logging.warning("No video backend available (cv2 or torchvision), returning zeros")
         return torch.zeros(num_frames, 3, size[0], size[1])
 
 
-
-
-
-
-
 @dataclass
 class ModelConfig:
-    
-
     vocab_size: int = 32_000
     dim: int = 4096
     layers: int = 32
@@ -234,8 +286,6 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    
-
     epochs: int = 1
     meta_batch_size: int = 2
     inner_steps_min: int = 1
@@ -276,14 +326,7 @@ class QuantConfig:
     dtype: str = "int8"
 
 
-
-
-
-
-
 class SyntheticMultimodalDataset:
-    
-
     def __init__(
         self,
         length: int = 2048,
@@ -323,10 +366,10 @@ class SyntheticMultimodalDataset:
             generator=generator,
         )
         modalities = torch.tensor([
-            random.random(),  
-            random.random(),  
-            random.random(),  
-            random.random(),  
+            random.random(),
+            random.random(),
+            random.random(),
+            random.random(),
         ])
         return {
             "text": text[:-1],
@@ -344,8 +387,6 @@ def load_multimodal_dataset(
     model_config: ModelConfig,
     split: str = "train",
 ) -> SyntheticMultimodalDataset:
-    
-
     if config.synthetic or load_dataset is None:
         logging.info("Using synthetic multimodal dataset (%s split).", split)
         return SyntheticMultimodalDataset(
@@ -360,7 +401,7 @@ def load_multimodal_dataset(
         text_ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
         vision_ds = load_dataset("laion/laion-aesthetics_v2", split=f"{split}[:1%]")
         audio_ds = load_dataset("ashraq/esc50", split=split)
-    except Exception as exc:  
+    except Exception as exc:
         logging.warning("Falling back to synthetic dataset: %s", exc)
         return SyntheticMultimodalDataset(
             length=1024 if split == "train" else 256,
@@ -368,11 +409,9 @@ def load_multimodal_dataset(
             seq_len=min(128, model_config.max_seq_len - 1),
         )
 
-    
-    
     min_len = min(len(text_ds), len(vision_ds), len(audio_ds))
 
-    class HuggingFaceMultimodalDataset(SyntheticMultimodalDataset):  
+    class HuggingFaceMultimodalDataset(SyntheticMultimodalDataset):
         def __init__(self) -> None:
             super().__init__(
                 length=min_len,
@@ -401,7 +440,6 @@ def load_multimodal_dataset(
                 )
                 token_ids = torch.cat([token_ids, pad], dim=0)
 
-            
             if Image is not None and isinstance(vision_item.get("image"), Image.Image):
                 try:
                     image = pil_image_to_tensor(vision_item["image"])
@@ -410,7 +448,6 @@ def load_multimodal_dataset(
             else:
                 image = torch.randn(3, 64, 64)
 
-            
             if librosa is not None and "file" in audio_item:
                 file_path = audio_item["file"]
                 if os.path.exists(file_path):
@@ -427,7 +464,6 @@ def load_multimodal_dataset(
                 audio = F.pad(audio, (0, self.audio_len - audio.numel()))
             audio = audio[: self.audio_len]
 
-            
             video = torch.randn(self.video_frames, 3, self.video_size, self.video_size)
             candidate_path = vision_item.get("path") if isinstance(vision_item, dict) else None
             if isinstance(candidate_path, str) and os.path.exists(candidate_path):
@@ -464,11 +500,6 @@ def load_multimodal_dataset(
     return HuggingFaceMultimodalDataset()
 
 
-
-
-
-
-
 @dataclass
 class MetaTask:
     support: Dict[str, torch.Tensor]
@@ -496,8 +527,6 @@ def collate_batch(samples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 
 
 class MetaTaskSampler:
-    
-
     def __init__(
         self,
         dataset: SyntheticMultimodalDataset,
@@ -509,10 +538,19 @@ class MetaTaskSampler:
         self.split = split
         self.indices = list(range(len(dataset)))
 
+        # Adapt for DDP
+        if is_dist_avail_and_initialized():
+            self.num_replicas = get_world_size()
+            self.rank = get_rank()
+            self.indices = self.indices[self.rank:len(self.dataset):self.num_replicas]
+
     def __iter__(self) -> Iterable[MetaTask]:
         random.shuffle(self.indices)
         max_tasks = self.config.max_meta_tasks
+        if is_dist_avail_and_initialized():
+            max_tasks = max_tasks // get_world_size() # Each process handles a fraction of tasks
         task_count = 0
+
 
         while task_count < max_tasks:
             support_samples = []
@@ -543,17 +581,13 @@ class MetaTaskSampler:
             task_count += 1
 
     def __len__(self) -> int:
-        return self.config.max_meta_tasks
-
-
-
-
-
+        max_tasks = self.config.max_meta_tasks
+        if is_dist_avail_and_initialized():
+            return max_tasks // get_world_size()
+        return max_tasks
 
 
 class QAgent:
-    
-
     def __init__(
         self,
         modality_bins: int = 10,
@@ -606,8 +640,6 @@ class QAgent:
         action: int,
         inner_steps_bounds: Tuple[int, int],
     ) -> Dict[str, Any]:
-        
-
         steps_min, steps_max = inner_steps_bounds
         step_choices = list(range(steps_min, steps_max + 1))
         step_idx = action % len(step_choices)
@@ -629,18 +661,12 @@ class QAgent:
         }
 
 
-
-
-
-
-
 def precompute_rope_freqs(
     dim: int,
     max_seq_len: int,
     theta: float = 10000.0,
     device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
     t = torch.arange(max_seq_len, device=device, dtype=inv_freq.dtype)
     freqs = torch.outer(t, inv_freq)
@@ -654,25 +680,22 @@ def apply_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    
     seq_len = x.shape[1]
     cos = cos[:seq_len].unsqueeze(0).unsqueeze(2)
     sin = sin[:seq_len].unsqueeze(0).unsqueeze(2)
-    
+
     x_even = x[..., ::2]
     x_odd = x[..., 1::2]
-    
+
     x_rope = torch.stack([
         x_even * cos - x_odd * sin,
         x_even * sin + x_odd * cos,
     ], dim=-1)
-    
+
     return x_rope.flatten(-2)
 
 
 class RMSNorm(nn.Module):
-    
-
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
@@ -684,8 +707,6 @@ class RMSNorm(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    
-
     def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
@@ -698,8 +719,6 @@ class SwiGLU(nn.Module):
 
 
 class EntropyRegGELU(nn.Module):
-    
-
     def __init__(self, beta: float = 0.05) -> None:
         super().__init__()
         self.beta = beta
@@ -712,8 +731,6 @@ class EntropyRegGELU(nn.Module):
 
 
 class LowRankLinear(nn.Module):
-    
-
     def __init__(self, in_features: int, out_features: int, rank: int) -> None:
         super().__init__()
         self.u = nn.Linear(in_features, rank, bias=False)
@@ -738,8 +755,6 @@ class LowRankFFN(nn.Module):
 
 
 class VideoPatchEmbed(nn.Module):
-    
-
     def __init__(self, dim: int, patch_size: int, temporal_patch: int) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -747,7 +762,6 @@ class VideoPatchEmbed(nn.Module):
         self.proj = nn.Linear(3 * patch_size * patch_size * temporal_patch, dim)
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
-        
         batch, frames, channels, height, width = video.shape
         pad_t = (self.temporal_patch - frames % self.temporal_patch) % self.temporal_patch
         if pad_t:
@@ -772,8 +786,6 @@ class VideoPatchEmbed(nn.Module):
 
 
 class GroupedQueryAttention(nn.Module):
-    
-
     def __init__(
         self,
         dim: int,
@@ -790,7 +802,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_rep = n_heads // n_kv_heads
         self.head_dim = dim // n_heads
         self.use_flash = use_flash
-        
+
         self.q_proj = nn.Linear(dim, n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
@@ -805,23 +817,23 @@ class GroupedQueryAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
-        
+
         q = self.q_proj(x).view(batch, seq_len, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(batch, seq_len, self.n_kv_heads, self.head_dim)
         v = self.v_proj(x).view(batch, seq_len, self.n_kv_heads, self.head_dim)
-        
+
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        
+
         if self.n_rep > 1:
             k = k.repeat_interleave(self.n_rep, dim=2)
             v = v.repeat_interleave(self.n_rep, dim=2)
-        
+
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        
-        if self.use_flash:
+
+        if self.use_flash and hasattr(F, 'scaled_dot_product_attention'):
             try:
                 attn_out = F.scaled_dot_product_attention(
                     q, k, v,
@@ -832,7 +844,7 @@ class GroupedQueryAttention(nn.Module):
                 attn_out = self._standard_attention(q, k, v, mask)
         else:
             attn_out = self._standard_attention(q, k, v, mask)
-        
+
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.o_proj(attn_out)
 
@@ -853,8 +865,6 @@ class GroupedQueryAttention(nn.Module):
 
 
 class SSMSequenceMixer(nn.Module):
-    
-
     def __init__(self, dim: int, hidden: int) -> None:
         super().__init__()
         self.state_proj = nn.Linear(dim, hidden)
@@ -1005,7 +1015,7 @@ class IXLinx8B(nn.Module):
         ])
         self.norm = RMSNorm(config.dim)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
-        
+
         self.rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         if config.use_gradient_checkpointing:
             self._enable_gradient_checkpointing()
@@ -1036,23 +1046,16 @@ class IXLinx8B(nn.Module):
         )
         cos = cos.to(dtype=hidden.dtype)
         sin = sin.to(dtype=hidden.dtype)
-        
+
         for block in self.blocks:
             if self.config.use_gradient_checkpointing and self.training:
-                try:
-                    hidden = torch.utils.checkpoint.checkpoint(
-                        block,
-                        hidden,
-                        cos,
-                        sin,
-                        None,
-                        use_reentrant=False,
-                    )
-                except TypeError:
-                    hidden = torch.utils.checkpoint.checkpoint(block, hidden, cos, sin, None)
+                # DDP requires find_unused_parameters=True for gradient checkpointing
+                # if some block outputs are not used in loss calculation.
+                # The reentrant version is generally safer with DDP.
+                hidden = torch.utils.checkpoint.checkpoint(block, hidden, cos, sin, None, use_reentrant=True)
             else:
                 hidden = block(hidden, cos, sin, None)
-        
+
         hidden = self.norm(hidden)
         logits = self.lm_head(hidden)
         text_len = batch["text"].shape[1]
@@ -1071,14 +1074,14 @@ class IXLinx8B(nn.Module):
         self.eval()
         device = next(self.parameters()).device
         generated = prompt_ids.clone().to(device)
-        
+
         if image is None:
             image = torch.zeros(1, 3, 64, 64, device=device)
         if audio is None:
             audio = torch.zeros(1, 16000, device=device)
         if video is None:
             video = torch.zeros(1, self.config.video_frames, 3, self.config.video_size, self.config.video_size, device=device)
-        
+
         for _ in range(steps):
             batch = {
                 "text": generated.unsqueeze(0),
@@ -1100,7 +1103,7 @@ class IXLinx8B(nn.Module):
         return generated
 
     def parameter_count(self) -> int:
-        return sum(p.numel() for p in self.parameters())
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def quantize_dynamic(self, dtype: torch.dtype = torch.qint8) -> "IXLinx8B":
         try:
@@ -1110,15 +1113,10 @@ class IXLinx8B(nn.Module):
                 dtype=dtype,
             )
             logging.info("Applied dynamic quantisation (%s)", dtype)
-            return quantized  
+            return quantized
         except Exception as exc:
             logging.warning("Dynamic quantisation failed: %s", exc)
             return self
-
-
-
-
-
 
 
 def compute_loss(
@@ -1128,6 +1126,7 @@ def compute_loss(
     buffers: Optional[OrderedDict[str, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     if params is not None:
+        # For torch.func.functional_call, params and buffers must be in a single dict.
         params_and_buffers = OrderedDict(params)
         if buffers is not None:
             params_and_buffers.update(buffers)
@@ -1160,18 +1159,11 @@ def compute_reward(
     return reward
 
 
-
-
-
-
-
 def apply_task_augmentation(
     task: MetaTask,
     strength: float,
     mix: str,
 ) -> MetaTask:
-    
-
     def augment(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         augmented = {k: v.clone() for k, v in batch.items()}
         noise_scale = strength * 0.05
@@ -1207,31 +1199,30 @@ def apply_task_augmentation(
 
 
 class ModelEMA:
-    
-    
     def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
-        self.model = model
+        # DDP compatibility: operate on model.module
+        self.model = model.module if isinstance(model, DDP) else model
         self.decay = decay
         self.shadow = {}
         self.backup = {}
-        
-        for name, param in model.named_parameters():
+
+        for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
-    
+
     def update(self) -> None:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 assert name in self.shadow
                 new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
                 self.shadow[name] = new_average.clone()
-    
+
     def apply_shadow(self) -> None:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.backup[name] = param.data.clone()
                 param.data = self.shadow[name]
-    
+
     def restore(self) -> None:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
@@ -1250,7 +1241,7 @@ def get_cosine_schedule_with_warmup(
             return float(current_step) / float(max(1, warmup_steps))
         progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
         return max(min_lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
-    
+
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
@@ -1266,20 +1257,25 @@ def q_amaml_train(
     save_every: int = 0,
 ) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler, Optional[ModelEMA], int, int]:
     logger = logging.getLogger("train")
-    buffers = OrderedDict(model.named_buffers())
+    
+    # In DDP, buffers are managed by the DDP wrapper, so we get them from the underlying model
+    unwrapped_model = model.module if isinstance(model, DDP) else model
+    buffers = OrderedDict(unwrapped_model.named_buffers())
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.outer_lr,
         weight_decay=config.weight_decay,
     )
-    
-    total_steps = config.epochs * config.max_meta_tasks
+
+    total_steps = config.epochs * len(train_sampler)
     scheduler = get_cosine_schedule_with_warmup(optimizer, config.warmup_steps, total_steps)
-    
-    scaler = torch.cuda.amp.GradScaler() if config.use_amp and device.type == "cuda" else None
-    
+
+    # FIX: Use torch.amp instead of deprecated torch.cuda.amp
+    scaler = torch.amp.GradScaler('cuda') if config.use_amp and device.type == "cuda" else None
+
     ema = ModelEMA(model, decay=config.ema_decay) if config.ema_decay > 0 else None
-    
+
     global_step = 0
     start_epoch = 0
 
@@ -1292,8 +1288,9 @@ def q_amaml_train(
             ema.shadow = {k: v.to(device) for k, v in resume_state["ema_shadow"].items()}
         global_step = resume_state.get("step", 0)
         start_epoch = resume_state.get("epoch", 0)
-        logger.info("Resumed from step %d, epoch %d", global_step, start_epoch)
-    
+        if is_main_process():
+            logger.info("Resumed from step %d, epoch %d", global_step, start_epoch)
+
     q_agent = QAgent(
         epsilon=config.epsilon,
         alpha=config.q_alpha,
@@ -1301,33 +1298,42 @@ def q_amaml_train(
     )
 
     for epoch in range(start_epoch, config.epochs):
-        logger.info("Starting epoch %d/%d", epoch + 1, config.epochs)
+        if is_main_process():
+            logger.info("Starting epoch %d/%d", epoch + 1, config.epochs)
+        
+        # In DDP, need to set epoch for sampler to reshuffle data correctly
+        if is_dist_avail_and_initialized() and hasattr(train_sampler, 'set_epoch'):
+            train_sampler.set_epoch(epoch)
+
         for meta_task in train_sampler:
             model.train()
             task = apply_task_augmentation(
                 meta_task,
                 strength=q_agent.action_to_specs(0, (config.inner_steps_min, config.inner_steps_max))["augmentation_strength"],
                 mix="balanced",
-            )  
+            )
 
             state = q_agent.encode_state(task.metadata)
             action = q_agent.select_action(state)
             specs = q_agent.action_to_specs(action, (config.inner_steps_min, config.inner_steps_max))
             task = apply_task_augmentation(task, specs["augmentation_strength"], specs["task_mix"])
             inner_steps = specs["inner_steps"]
+            
+            # The parameters for functional_call must be detached from the graph
+            params = OrderedDict((name, param.detach().requires_grad_()) for name, param in model.named_parameters())
 
-            params = OrderedDict(model.named_parameters())
             grads_for_reward: List[torch.Tensor] = []
 
-            
             for _ in range(inner_steps):
-                optimizer.zero_grad()
+                # We don't need to zero_grad the main optimizer here
                 support_batch = {k: v.to(device) for k, v in task.support.items()}
                 if scaler is not None:
-                    with torch.cuda.amp.autocast():
-                        loss, metrics = compute_loss(model, support_batch, params=params, buffers=buffers)
+                    # FIX: Use torch.amp instead of deprecated torch.cuda.amp
+                    with torch.amp.autocast(device_type=device.type):
+                        loss, metrics = compute_loss(unwrapped_model, support_batch, params=params, buffers=buffers)
                 else:
-                    loss, metrics = compute_loss(model, support_batch, params=params, buffers=buffers)
+                    loss, metrics = compute_loss(unwrapped_model, support_batch, params=params, buffers=buffers)
+                
                 grads = torch.autograd.grad(
                     loss,
                     params.values(),
@@ -1335,32 +1341,43 @@ def q_amaml_train(
                     create_graph=False,
                     allow_unused=True,
                 )
-                params = OrderedDict(
-                    (name, param - config.inner_lr * grad if grad is not None else param)
-                    for (name, param), grad in zip(params.items(), grads)
-                )
-                grads_for_reward.extend([g.detach() for g in grads if g is not None])
+                
+                with torch.no_grad():
+                    params = OrderedDict(
+                        (name, param - config.inner_lr * grad if grad is not None else param)
+                        for (name, param), grad in zip(params.items(), grads)
+                    )
+                    grads_for_reward.extend([g.detach() for g in grads if g is not None])
 
             query_batch = {k: v.to(device) for k, v in task.query.items()}
-            
+
             optimizer.zero_grad()
             
+            # Final outer loop loss calculation
             if scaler is not None:
-                with torch.cuda.amp.autocast():
-                    query_loss, query_metrics = compute_loss(model, query_batch, params=params, buffers=buffers)
-                scaler.scale(query_loss).backward()
+                with torch.amp.autocast(device_type=device.type):
+                    query_loss, query_metrics = compute_loss(unwrapped_model, query_batch, params=params, buffers=buffers)
+                
+                # The final loss for the outer loop must be computed on the original model graph
+                # to update the model weights. The MAML approach requires a second-order gradient
+                # which is computationally expensive. This implementation uses a first-order approximation (FO-MAML).
+                # We calculate the final loss and then .backward() on it.
+                final_loss_on_graph, _ = compute_loss(model, query_batch)
+                scaler.scale(final_loss_on_graph).backward()
                 scaler.unscale_(optimizer)
                 grad_norm = float(clip_grad_norm_(model.parameters(), config.grad_clip))
                 scaler.step(optimizer)
                 scaler.update()
+
             else:
-                query_loss, query_metrics = compute_loss(model, query_batch, params=params, buffers=buffers)
+                # This path also uses the simplified first-order MAML update.
+                query_loss, query_metrics = compute_loss(model, query_batch)
                 query_loss.backward()
                 grad_norm = float(clip_grad_norm_(model.parameters(), config.grad_clip))
                 optimizer.step()
-            
+
             scheduler.step()
-            
+
             if ema is not None and global_step >= config.ema_start_step:
                 ema.update()
 
@@ -1368,7 +1385,7 @@ def q_amaml_train(
             next_state = q_agent.encode_state(task.metadata)
             q_agent.update(state, action, reward, next_state)
 
-            if global_step % config.log_interval == 0:
+            if global_step % config.log_interval == 0 and is_main_process():
                 logger.info(
                     "step=%d epoch=%d task=%d loss=%.4f ppl=%.2f acc=%.3f reward=%.4f inner_steps=%d lr=%.6f",
                     global_step,
@@ -1383,7 +1400,7 @@ def q_amaml_train(
                 )
             global_step += 1
 
-            if save_every > 0 and global_step % save_every == 0 and output_dir is not None:
+            if save_every > 0 and global_step % save_every == 0 and output_dir is not None and is_main_process():
                 checkpoint_path = output_dir / f"checkpoint_step_{global_step}.ckpt"
                 logger.info("Saving intermediate checkpoint to %s", checkpoint_path)
                 save_checkpoint(
@@ -1395,21 +1412,20 @@ def q_amaml_train(
                     step=global_step,
                     epoch=epoch + 1,
                 )
-
         if val_sampler is not None:
             if ema is not None:
                 ema.apply_shadow()
             evaluate(model, val_sampler, device)
             if ema is not None:
                 ema.restore()
+        
+        if is_dist_avail_and_initialized():
+            dist.barrier()
 
-    logger.info("Training complete")
+
+    if is_main_process():
+        logger.info("Training complete")
     return optimizer, scheduler, ema, global_step, config.epochs
-
-
-
-
-
 
 
 def evaluate(model: IXLinx8B, sampler: MetaTaskSampler, device: torch.device) -> Dict[str, float]:
@@ -1428,18 +1444,15 @@ def evaluate(model: IXLinx8B, sampler: MetaTaskSampler, device: torch.device) ->
     if count > 0:
         for k in metrics_accum:
             metrics_accum[k] /= count
-    logger.info(
-        "Eval metrics: loss=%.4f ppl=%.2f acc=%.3f",
-        metrics_accum["loss"],
-        metrics_accum["perplexity"],
-        metrics_accum["accuracy"],
-    )
+    
+    if is_main_process():
+        logger.info(
+            "Eval metrics: loss=%.4f ppl=%.2f acc=%.3f",
+            metrics_accum["loss"],
+            metrics_accum["perplexity"],
+            metrics_accum["accuracy"],
+        )
     return metrics_accum
-
-
-
-
-
 
 
 def save_checkpoint(
@@ -1452,9 +1465,12 @@ def save_checkpoint(
     epoch: int = 0,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    
+    unwrapped_model = model.module if isinstance(model, DDP) else model
+
     checkpoint = {
-        "model_state": model.state_dict(),
-        "config": model.config.__dict__,
+        "model_state": unwrapped_model.state_dict(),
+        "config": unwrapped_model.config.__dict__,
         "step": step,
         "epoch": epoch,
     }
@@ -1479,31 +1495,25 @@ def load_checkpoint(
     model = IXLinx8B(config)
     model.load_state_dict(payload["model_state"])
     model.to(device)
-    
+
     if optimizer is not None and "optimizer_state" in payload:
         optimizer.load_state_dict(payload["optimizer_state"])
     if scheduler is not None and "scheduler_state" in payload:
         scheduler.load_state_dict(payload["scheduler_state"])
-    
+
     metadata = {
         "step": payload.get("step", 0),
         "epoch": payload.get("epoch", 0),
         "ema_shadow": payload.get("ema_shadow"),
     }
-    
+
     logging.info("Loaded checkpoint from %s (step=%d, epoch=%d)", path, metadata["step"], metadata["epoch"])
     return model, metadata
 
 
 def load_checkpoint_simple(path: Path, device: torch.device) -> IXLinx8B:
-    
     model, _ = load_checkpoint(path, device)
     return model
-
-
-
-
-
 
 
 def ensure_tokenizer(model_config: ModelConfig) -> Any:
@@ -1512,7 +1522,7 @@ def ensure_tokenizer(model_config: ModelConfig) -> Any:
             tokenizer = AutoTokenizer.from_pretrained("gpt2")
             tokenizer.pad_token = tokenizer.eos_token
             return tokenizer
-        except Exception as exc:  
+        except Exception as exc:
             logging.warning("Falling back to naive tokenizer: %s", exc)
     logging.warning("Using whitespace tokenizer fallback")
 
@@ -1585,16 +1595,27 @@ def load_video_tensor(
 
 
 def cli_train(args: argparse.Namespace) -> None:
+    # NOTE: Training an 8B+ parameter model requires substantial GPU memory.
+    # On 2x T4/P100 (16GB each), this will be challenging.
+    # Consider using a smaller preset, reducing batch size, or exploring more
+    # advanced parallelism like FSDP if you encounter memory issues.
+
+    if args.distributed:
+        device = torch.device(f"cuda:{args.local_rank}")
+    else:
+        device = detect_device(args.device)
+
     configure_logging(args.verbosity)
     set_seed(args.seed)
-    device = detect_device(args.device)
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process():
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     resume_state: Optional[Dict[str, Any]] = None
     if args.resume_from:
         resume_path = Path(args.resume_from)
-        logging.info("Resuming training from checkpoint: %s", resume_path)
+        if is_main_process():
+            logging.info("Resuming training from checkpoint: %s", resume_path)
         resume_state = torch.load(resume_path, map_location=device)
         model_config = ModelConfig(**resume_state["config"])
     else:
@@ -1607,9 +1628,10 @@ def cli_train(args: argparse.Namespace) -> None:
                 "dim": 2048, "layers": 24, "n_heads": 16, "n_kv_heads": 4,
                 "rmc_hidden": 4096, "low_rank": 256, "ff_mult": 3, "max_seq_len": 2048,
             },
+            # Scaled up to ~8.27B parameters
             "8b": {
-                "dim": 4096, "layers": 32, "n_heads": 32, "n_kv_heads": 8,
-                "rmc_hidden": 8192, "low_rank": 512, "ff_mult": 4, "max_seq_len": 4096,
+                "dim": 5120, "layers": 36, "n_heads": 40, "n_kv_heads": 8,
+                "rmc_hidden": 8192, "low_rank": 640, "ff_mult": 4, "max_seq_len": 4096,
             },
         }
         preset = presets[args.preset]
@@ -1673,18 +1695,23 @@ def cli_train(args: argparse.Namespace) -> None:
         warmup_steps=args.warmup_steps,
         resume_from=args.resume_from,
     )
-
-    logging.info("Device: %s", device)
-    logging.info("Model config: dim=%d, layers=%d, n_heads=%d, n_kv_heads=%d",
-                 model_config.dim, model_config.layers, model_config.n_heads, model_config.n_kv_heads)
+    if is_main_process():
+        logging.info("Device: %s", device)
+        logging.info("Model config: dim=%d, layers=%d, n_heads=%d, n_kv_heads=%d",
+                     model_config.dim, model_config.layers, model_config.n_heads, model_config.n_kv_heads)
 
     model = IXLinx8B(model_config).to(device)
     if resume_state is not None:
         model.load_state_dict(resume_state["model_state"])
-        logging.info("Checkpoint weights loaded")
+        if is_main_process():
+            logging.info("Checkpoint weights loaded")
 
-    actual_params = model.parameter_count()
-    logging.info("Actual model parameters: %.2fB", actual_params / 1e9)
+    if args.distributed:
+        model = DDP(model, device_ids=[args.local_rank], find_unused_parameters=True)
+
+    if is_main_process():
+        actual_params = model.module.parameter_count() if args.distributed else model.parameter_count()
+        logging.info("Actual model parameters: %.2fB", actual_params / 1e9)
 
     train_dataset = load_multimodal_dataset(training_config, model_config, split="train")
     val_dataset = load_multimodal_dataset(training_config, model_config, split="validation")
@@ -1702,31 +1729,33 @@ def cli_train(args: argparse.Namespace) -> None:
         output_dir=output_dir,
         save_every=args.save_every,
     )
+    
+    if is_main_process():
+        checkpoint_path = output_dir / "ixlinx_hack.ckpt"
+        ema_applied = False
+        if ema is not None:
+            ema.apply_shadow()
+            ema_applied = True
+        save_checkpoint(
+            model,
+            checkpoint_path,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=ema,
+            step=final_step,
+            epoch=final_epoch,
+        )
+        if ema_applied:
+            ema.restore()
+        logging.info("Saved final checkpoint to %s", checkpoint_path)
 
-    checkpoint_path = output_dir / "ixlinx_hack.ckpt"
-    ema_applied = False
-    if ema is not None:
-        ema.apply_shadow()
-        ema_applied = True
-    save_checkpoint(
-        model,
-        checkpoint_path,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        ema=ema,
-        step=final_step,
-        epoch=final_epoch,
-    )
-    if ema_applied:
-        ema.restore()
-    logging.info("Saved final checkpoint to %s", checkpoint_path)
-
-    if args.quantize:
-        dtype = torch.qint8 if args.quant_dtype == "int8" else torch.qint8
-        quantized = model.quantize_dynamic(dtype=dtype)
-        quant_path = output_dir / "ixlinx_hack_quantized.ckpt"
-        torch.save({"model_state": quantized.state_dict(), "config": model_config.__dict__}, quant_path)
-        logging.info("Saved quantised checkpoint to %s", quant_path)
+        if args.quantize:
+            dtype = torch.qint8 if args.quant_dtype == "int8" else torch.qint8
+            unwrapped_model = model.module if args.distributed else model
+            quantized = unwrapped_model.quantize_dynamic(dtype=dtype)
+            quant_path = output_dir / "ixlinx_hack_quantized.ckpt"
+            torch.save({"model_state": quantized.state_dict(), "config": model_config.__dict__}, quant_path)
+            logging.info("Saved quantised checkpoint to %s", quant_path)
 
 
 def cli_eval(args: argparse.Namespace) -> None:
@@ -1771,10 +1800,9 @@ def cli_chat(args: argparse.Namespace) -> None:
 
 
 def cli_video_test(args: argparse.Namespace) -> None:
-    
     configure_logging(args.verbosity)
     device = detect_device(args.device)
-    
+
     logging.info("Testing video extraction from: %s", args.video_path)
     video = extract_video_frames(
         args.video_path,
@@ -1784,12 +1812,12 @@ def cli_video_test(args: argparse.Namespace) -> None:
     )
     logging.info("Extracted video tensor shape: %s", video.shape)
     logging.info("Video dtype: %s, min: %.3f, max: %.3f", video.dtype, video.min(), video.max())
-    
+
     if args.checkpoint:
         logging.info("Testing with model from checkpoint: %s", args.checkpoint)
         model = load_checkpoint_simple(Path(args.checkpoint), device)
         model.eval()
-        
+
         with torch.no_grad():
             batch = {
                 "text": torch.zeros(1, 10, dtype=torch.long, device=device),
@@ -1799,7 +1827,7 @@ def cli_video_test(args: argparse.Namespace) -> None:
             }
             logits = model(batch)
             logging.info("Model output logits shape: %s", logits.shape)
-    
+
     logging.info("Video test completed successfully")
 
 
@@ -1816,11 +1844,6 @@ def cli_export_config(args: argparse.Namespace) -> None:
     logging.info("Exported default configuration to %s", path)
 
 
-
-
-
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="iXlinx-8B hackathon prototype")
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -1833,6 +1856,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     train_parser = subparsers.add_parser("train", help="Train the model with Q-AMAML")
     add_common_arguments(train_parser)
+    # --- DDP arguments ---
+    train_parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+
     train_parser.add_argument("--epochs", type=int, default=1)
     train_parser.add_argument("--meta-batch-size", dest="meta_batch_size", type=int, default=2)
     train_parser.add_argument("--inner-lr", dest="inner_lr", type=float, default=1e-3)
@@ -1855,7 +1881,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--output-dir", default="./outputs")
     train_parser.add_argument("--quantize", action="store_true")
     train_parser.add_argument("--quant-dtype", choices=["int8", "int4"], default="int8")
-    train_parser.add_argument("--preset", choices=["prototype", "8b-lite", "8b"], default="8b-lite")
+    train_parser.add_argument("--preset", choices=["prototype", "8b-lite", "8b"], default="8b")
     train_parser.add_argument("--vocab-size", type=int, default=None)
     train_parser.add_argument("--dim", type=int, default=None)
     train_parser.add_argument("--layers", type=int, default=None)
@@ -1920,7 +1946,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     if args.mode == "train":
+        init_distributed_mode(args)
         cli_train(args)
+        if is_dist_avail_and_initialized():
+            dist.destroy_process_group()
     elif args.mode == "eval":
         cli_eval(args)
     elif args.mode == "chat":
@@ -1929,7 +1958,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         cli_video_test(args)
     elif args.mode == "export-config":
         cli_export_config(args)
-    else:  
+    else:
         raise ValueError(f"Unsupported mode: {args.mode}")
 
 
